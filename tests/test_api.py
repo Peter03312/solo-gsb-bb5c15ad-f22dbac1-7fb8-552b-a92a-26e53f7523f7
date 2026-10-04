@@ -57,6 +57,24 @@ def _check(client, version_id, use, at):
     )
 
 
+def _preview(client, payload):
+    return client.post("/license-changes/preview", json=payload)
+
+
+def _preview_flip(client, change_id, version_id, effective_at, uses, use, at):
+    return _preview(
+        client,
+        {
+            "change_id": change_id,
+            "version_id": version_id,
+            "effective_at": effective_at,
+            "allowed_uses": uses,
+            "use": use,
+            "at": at,
+        },
+    )
+
+
 # -- registration ----------------------------------------------------------
 
 
@@ -298,3 +316,263 @@ def test_demo_fixture_permissions(tmp_path):
             params={"version_id": "demo-derived-1", "use": "research", "at": _iso(2026, 7, 1)},
         ).json()
         assert later["allowed"] is True
+
+
+# -- change preview --------------------------------------------------------
+
+
+def _preview_graph(client):
+    # a <- b <- d1, a <- d2 <- d1  (diamond: a is a shared ancestor of d1).
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "b", ["a"])
+    _change(client, "cb", "b", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d2", ["a"])
+    _change(client, "cd2", "d2", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d1", ["b", "d2"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+
+
+def test_preview_flips_target_and_descendants_deny_to_allow(client):
+    _register(client, "a")
+    _change(client, "ca1", "a", _iso(2026, 1, 1), ["research"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+
+    at = _iso(2026, 5, 1)
+    # Current state: review is blocked by a for both a and d1.
+    assert _check(client, "a", "review", at).json()["allowed"] is False
+    assert _check(client, "d1", "review", at).json()["allowed"] is False
+
+    resp = _preview_flip(client, "ca2", "a", _iso(2026, 4, 1), ["research", "review"], "review", at)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["replayed"] is False
+    assert body["scope"] == ["a", "d1"]
+    flips = {entry["version_id"]: entry for entry in body["impacted_versions"]}
+    assert set(flips) == {"a", "d1"}
+    for entry in flips.values():
+        assert entry["before_allowed"] is False
+        assert entry["after_allowed"] is True
+        assert entry["before_blockers"]
+        assert all(bl["version_id"] == "a" and bl["reason"] == "use_not_allowed"
+                   for bl in entry["before_blockers"])
+        assert entry["after_blockers"] == []
+    assert flips["d1"]["closure"] == ["d1", "a"]
+    assert flips["a"]["after_allowed_uses_intersection"] == ["research", "review"]
+
+
+def test_preview_flip_allow_to_deny_reports_after_blocker(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+
+    at = _iso(2026, 5, 1)
+    body = _preview_flip(client, "ca2", "a", _iso(2026, 4, 1), ["research"], "review", at).json()
+    flips = {entry["version_id"]: entry for entry in body["impacted_versions"]}
+    assert set(flips) == {"a", "d1"}
+    for entry in flips.values():
+        assert entry["before_allowed"] is True
+        assert entry["after_allowed"] is False
+        assert entry["before_blockers"] == []
+        assert len(entry["after_blockers"]) == 1
+        blocker = entry["after_blockers"][0]
+        assert blocker["version_id"] == "a"
+        assert blocker["reason"] == "use_not_allowed"
+        assert blocker["change_id"] == "ca2"
+
+
+def test_preview_query_before_effective_time_has_no_impact(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    at = _iso(2026, 3, 1)
+
+    # Effective after the query instant: the proposal is not yet in force.
+    body = _preview_flip(client, "cf", "a", _iso(2026, 4, 1), ["research", "review"], "review", at).json()
+    assert body["scope"] == ["a"]
+    assert body["impacted_versions"] == []
+    # And nothing was written.
+    assert _check(client, "a", "review", at).json()["allowed"] is False
+    assert client.get("/license-changes/cf").status_code == 404
+
+
+def test_preview_covered_by_later_stored_change_has_no_impact(client):
+    _register(client, "a")
+    _change(client, "ca1", "a", _iso(2026, 1, 1), ["research"])
+    # A stored change already effective later than the proposal wins.
+    _change(client, "ca3", "a", _iso(2026, 5, 1), ["research", "review"])
+    at = _iso(2026, 8, 1)
+
+    body = _preview_flip(client, "ca2", "a", _iso(2026, 3, 1), ["review", "research"], "review", at).json()
+    assert body["impacted_versions"] == []
+    assert client.get("/license-changes/ca2").status_code == 404
+
+    # A proposal effective later than every stored change does flip the state.
+    body = _preview_flip(client, "ca4", "a", _iso(2026, 6, 1), ["research"], "review", at).json()
+    entry = body["impacted_versions"][0]
+    assert entry["version_id"] == "a"
+    assert entry["before_allowed"] is True
+    assert entry["after_allowed"] is False
+    assert entry["after_blockers"][0]["change_id"] == "ca4"
+    assert client.get("/license-changes/ca4").status_code == 404
+
+
+def test_preview_unknown_version_is_404(client):
+    resp = _preview_flip(client, "c1", "ghost", _iso(2026, 1, 1), ["research"], "research", _iso(2026, 2, 1))
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_preview_change_id_conflict_is_409(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])
+    resp = _preview_flip(client, "c1", "a", _iso(2026, 2, 1), ["commercial"], "commercial", _iso(2026, 3, 1))
+    assert resp.status_code == 409
+    assert "变更标识" in resp.json()["message"]
+    # Preview still writes nothing.
+    assert _change(client, "c2", "a", _iso(2026, 2, 1), ["commercial"]).status_code == 201
+
+
+def test_preview_same_version_same_time_conflict_is_409(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])
+    resp = _preview_flip(client, "c2", "a", _iso(2026, 1, 1), ["review"], "review", _iso(2026, 2, 1))
+    assert resp.status_code == 409
+    assert "同一生效时刻" in resp.json()["message"]
+
+
+def test_preview_same_id_same_content_replay_has_no_impact(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research", "review"])
+    at = _iso(2026, 5, 1)
+    body = _preview_flip(client, "c1", "a", _iso(2026, 1, 1), ["review", "research", "review"], "review", at).json()
+    assert body["replayed"] is True
+    assert body["impacted_versions"] == []
+
+    # Even a proposal that *would* conflict on time is neutralised when the
+    # stored change with that id is itself the one at that time.
+    assert _check(client, "a", "review", at).json()["allowed"] is True
+
+
+def test_preview_naive_times_are_422(client):
+    _register(client, "a")
+    base = {
+        "change_id": "c1",
+        "version_id": "a",
+        "effective_at": _iso(2026, 1, 1),
+        "allowed_uses": ["research"],
+        "use": "research",
+        "at": _iso(2026, 2, 1),
+    }
+    bad_effective = {**base, "effective_at": "2026-01-01T00:00:00"}
+    assert _preview(client, bad_effective).status_code == 422
+    bad_query = {**base, "at": "2026-02-01T00:00:00"}
+    assert _preview(client, bad_query).status_code == 422
+
+
+def test_preview_diamond_descendant_counted_once(client):
+    _preview_graph(client)
+    at = _iso(2026, 5, 1)
+    body = _preview_flip(
+        client, "ca2", "a", _iso(2026, 4, 1), ["research"], "review", at
+    ).json()
+    # Each descendant of a appears exactly once despite the diamond edges.
+    assert body["scope"] == ["a", "b", "d2", "d1"]
+    assert sorted(entry["version_id"] for entry in body["impacted_versions"]) == ["a", "b", "d1", "d2"]
+    d1 = next(entry for entry in body["impacted_versions"] if entry["version_id"] == "d1")
+    assert d1["closure"] == ["d1", "b", "d2", "a"]
+    # a blocks d1 exactly once.
+    assert [bl["version_id"] for bl in d1["after_blockers"]] == ["a"]
+    # No writes happened.
+    assert client.get("/license-changes/ca2").status_code == 404
+
+
+def test_preview_fills_no_valid_license_gap(client):
+    # A change on a version with no earlier license can remove its block.
+    _register(client, "a")
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research"])
+    at = _iso(2026, 5, 1)
+    assert _check(client, "d1", "research", at).json()["allowed"] is False
+
+    body = _preview_flip(client, "ca1", "a", _iso(2026, 3, 1), ["research"], "research", at).json()
+    flips = {entry["version_id"]: entry for entry in body["impacted_versions"]}
+    assert set(flips) == {"a", "d1"}
+    assert flips["a"]["before_blockers"][0]["reason"] == "no_valid_license"
+    assert flips["d1"]["before_blockers"][0]["reason"] == "no_valid_license"
+    assert all(entry["after_allowed"] is True for entry in flips.values())
+
+
+def test_preview_does_not_write_under_concurrent_commits(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    for i in range(6):
+        _register(client, f"d{i}", ["a"])
+        _change(client, f"cd{i}", f"d{i}", _iso(2026, 1, 1), ["research", "review"])
+
+    # Exercise the snapshot guarantee directly: the one process-wide SQLite
+    # connection is shared by all threads (check_same_thread=False), so a
+    # preview's reads must be serialised against writes via the db lock and
+    # must never persist their hypothetical change.
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    errors: list[str] = []
+
+    def preview_loop(idx: int) -> None:
+        for i in range(25):
+            try:
+                result = service.preview_change(
+                    change_id=f"cp-{idx}-{i}",
+                    version_id="a",
+                    effective_at=datetime(2026, 4, 1, tzinfo=timezone.utc),
+                    allowed_uses=["research", "review"],
+                    use="review",
+                    at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"preview raised: {type(exc).__name__}: {exc}")
+                return
+            scope = set(result["scope"])
+            for entry in result["impacted_versions"]:
+                if not set(entry["closure"]) <= scope:
+                    errors.append("closure mixed with versions outside snapshot scope")
+                    return
+                if len(entry["closure"]) != len(set(entry["closure"])):
+                    errors.append("diamond descendant counted twice")
+                    return
+
+    def submit_loop(idx: int) -> None:
+        from datetime import timedelta
+
+        base_day = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        for i in range(25):
+            # Disjoint effective instants per thread -> no same-time 409.
+            effective = base_day + timedelta(days=idx * 31 + i)
+            try:
+                _, replayed = service.submit_change(
+                    change_id=f"w-{idx}-{i}",
+                    version_id="a",
+                    effective_at=effective,
+                    allowed_uses=["research"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"submit raised: {type(exc).__name__}: {exc}")
+                return
+            if replayed:
+                errors.append("fresh change unexpectedly replayed")
+                return
+
+    import threading
+
+    threads = [threading.Thread(target=preview_loop, args=(i,)) for i in range(3)]
+    threads += [threading.Thread(target=submit_loop, args=(i,)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    # None of the preview-only change ids leaked into the store.
+    for idx in range(3):
+        for i in range(25):
+            assert client.get(f"/license-changes/cp-{idx}-{i}").status_code == 404

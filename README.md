@@ -12,6 +12,7 @@
   3. 对各版本的允许用途取**交集**；
   4. **任一版本在该时刻没有有效许可，或其有效许可不包含所申请用途，即拒绝**；
   5. 响应返回：`allowed` 可否使用、`basis` 各版本所依据的变更、`blockers` 所有阻断版本（含原因）、`allowed_uses_intersection` 交集。
+- **变更预演（不写入）**：提交变更前可经 `POST /license-changes/preview` 预演其对目标版本及全部后代的影响；同一数据快照下分别计算现状与假设提交后的判定，仅返回允许状态翻转的版本（含前后判定与阻断原因），菱形继承的后代只计一次；查询早于生效时刻、或已有更晚有效变更覆盖时结果为空且绝不误报；预演不写入任何数据，冲突/幂等语义与提交接口一致。
 - **幂等与冲突**：
   - 相同**变更标识**且语义内容（版本、生效时刻、允许用途集合；用途顺序/重复不影响）完全相同的重复提交，返回**同一结果**（HTTP `200`，`replayed=true`）；
   - 标识相同而内容不同 → `409 conflict`；
@@ -155,7 +156,52 @@ curl -s "http://localhost:8000/permissions/check?version_id=demo-derived-1&use=r
 # -> allowed=false, blockers 含 demo-root-a / use_not_allowed
 ```
 
-### 4. 查询接口
+### 4. 预演许可变更（提交前影响分析，不写入）
+
+`POST /license-changes/preview`
+
+在**真正提交变更之前**，传入与提交接口相同的变更字段（变更标识、已登记版本、带时区的生效时刻、允许用途全集）外加待判定用途 `use` 与带时区的查询时刻 `at`，服务对同一份数据快照分别计算「现状」与「假设该变更已提交」两种判定，仅返回目标版本及其全部后代中**允许状态发生翻转**的版本。
+
+```bash
+curl -s -X POST http://localhost:8000/license-changes/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "change_id": "preview-a-commercial",
+    "version_id": "demo-root-a",
+    "effective_at": "2026-04-01T00:00:00Z",
+    "allowed_uses": ["research", "review", "commercial"],
+    "use": "commercial",
+    "at": "2026-05-01T00:00:00Z"
+  }'
+```
+
+上例预演「2026-04 起给 `demo-root-a` 放开 commercial」对 5 月判定的影响，`impacted_versions` 会同时包含 `demo-root-a` 与后代 `demo-derived-1`，每条给出：
+
+- `before_allowed` / `after_allowed`：提交前、假设提交后的允许状态；
+- `before_blockers` / `after_blockers`：两个时点的**全部**阻断版本与原因（`no_valid_license` / `use_not_allowed`，字段口径同判定接口）；
+- `before_basis` / `after_basis`、`before/after_allowed_uses_intersection`：所依据的最近变更与祖先许可交集；
+- `closure`：该版本判定时展开的自身及全部祖先。
+
+顶层 `scope` 为本次计算覆盖的「目标版本 + 全部后代」（广度优先、去重，**菱形继承的后代只计一次**）；预演只做只读计算，绝不写入变更（可用 `GET /license-changes/{change_id}` 验证预演标识仍为 `404`）。
+
+不误报的两种情形（`impacted_versions` 为空数组）：
+
+- **查询时刻早于生效时刻**：变更尚未生效，前后判定一致；
+- **已有更晚（且不晚于查询时刻）的已登记变更覆盖该时刻**：按「最近有效变更」规则，预演变更不会成为依据。
+
+错误与幂等语义与 `POST /license-changes` 完全一致：
+
+| 情形 | 结果 |
+| --- | --- |
+| 目标版本不存在 | `404 not_found` |
+| 相同 `change_id` 已存在但内容不同 | `409 conflict` |
+| 同版本同生效时刻已存在**不同**变更 | `409 conflict` |
+| 相同标识与语义内容的重放 | `200` 且 `replayed=true`，`impacted_versions` 恒为空（现状与「重放后」本就相同，无影响） |
+| `effective_at` / `at` 无时区 | `422` |
+
+并发说明：预演在单个 SQLite WAL 只读快照事务内、并在进程级锁保护下一次性读取版本、父引用与变更，评估过程中其他请求的提交不会混入，不会出现「版本来自旧快照、变更来自新快照」的拼接结果。
+
+### 5. 查询接口
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -200,4 +246,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验与示例数据初始化。
+测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，以及变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用）。

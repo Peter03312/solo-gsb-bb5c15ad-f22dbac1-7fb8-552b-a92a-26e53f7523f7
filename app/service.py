@@ -6,8 +6,9 @@ import hashlib
 import json
 import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 from .database import Database
 
@@ -338,3 +339,299 @@ class LicenseService:
             "blockers": blockers,
             "allowed_uses_intersection": result_intersection,
         }
+
+    # -- change preview (no writes) ---------------------------------------
+
+    def preview_change(
+        self,
+        *,
+        change_id: str | None,
+        version_id: str,
+        effective_at: datetime,
+        allowed_uses: list[str],
+        use: str,
+        at: datetime,
+    ) -> dict[str, Any]:
+        """Dry-run a change without persisting it.
+
+        Evaluates the given ``use`` at query time ``at`` for the target
+        version and every descendant twice — once on the current snapshot and
+        once as if the proposed change were committed — and returns only the
+        versions whose allow/deny status flips, with before/after blockers.
+
+        Conflict semantics mirror :meth:`submit_change`: unknown version ->
+        404; same change id with different content, or a different change at
+        the same (version, effective instant) -> 409; same id and content is a
+        replay with no effect. All reads come from one pinned read snapshot so
+        concurrent commits cannot interleave into the evaluation.
+        """
+        if effective_at.tzinfo is None:
+            raise InvalidTimeError("生效时刻必须带时区信息")
+        if at.tzinfo is None:
+            raise InvalidTimeError("查询时刻必须带时区信息")
+        use = use.strip()
+        if not use:
+            raise ServiceError("用途不能为空")
+
+        effective = to_canonical(effective_at)
+        uses = sorted(set(u.strip() for u in allowed_uses if u.strip()))
+        change_id = change_id or f"c-{uuid.uuid4().hex}"
+        digest = content_hash(version_id, effective, uses)
+
+        with self.db.lock:
+            if self.db.get_version(version_id) is None:
+                raise NotFoundError("版本不存在，无法为其预演许可变更", {"version_id": version_id})
+
+            existing = self.db.get_change(change_id)
+            replayed = False
+            if existing is not None:
+                same = (
+                    existing["version_id"] == version_id
+                    and existing["effective_at"] == effective
+                    and existing["content_hash"] == digest
+                )
+                if not same:
+                    raise ConflictError(
+                        "相同变更标识已存在但内容不同",
+                        {
+                            "change_id": change_id,
+                            "submitted_version_id": version_id,
+                            "existing_version_id": existing["version_id"],
+                            "submitted_effective_at": effective,
+                            "existing_effective_at": existing["effective_at"],
+                        },
+                    )
+                replayed = True
+            else:
+                twin = self.db.change_at_same_time(version_id, effective)
+                if twin is not None and twin["change_id"] != change_id:
+                    raise ConflictError(
+                        "该版本在同一生效时刻已存在不同变更",
+                        {
+                            "version_id": version_id,
+                            "effective_at": effective,
+                            "existing_change_id": twin["change_id"],
+                            "submitted_change_id": change_id,
+                        },
+                    )
+            snapshot = self._capture_snapshot()
+
+        at_canonical = to_canonical(at)
+        scope = snapshot.descendants_of(version_id)
+        override = None if replayed else EffectiveChange(
+            change_id=change_id,
+            version_id=version_id,
+            effective_at=effective,
+            allowed_uses=uses,
+        )
+
+        impacted: list[dict[str, Any]] = []
+        for node in scope:
+            before = _evaluate(snapshot, node, use, at_canonical, None)
+            after = (
+                before
+                if override is None
+                else _evaluate(snapshot, node, use, at_canonical, override)
+            )
+            if before["allowed"] == after["allowed"]:
+                # Query before the effective instant, a later stored change
+                # already covering the proposal, or simply no difference.
+                continue
+            impacted.append(
+                {
+                    "version_id": node,
+                    "closure": before["closure"],
+                    "before_allowed": before["allowed"],
+                    "after_allowed": after["allowed"],
+                    "before_blockers": before["blockers"],
+                    "after_blockers": after["blockers"],
+                    "before_basis": before["basis"],
+                    "after_basis": after["basis"],
+                    "before_allowed_uses_intersection": before["allowed_uses_intersection"],
+                    "after_allowed_uses_intersection": after["allowed_uses_intersection"],
+                }
+            )
+
+        return {
+            "replayed": replayed,
+            "change": {
+                "change_id": change_id,
+                "version_id": version_id,
+                "effective_at": parse_canonical(effective),
+                "allowed_uses": uses,
+            },
+            "query": {"use": use, "at": at.astimezone(timezone.utc)},
+            "scope": scope,
+            "impacted_versions": impacted,
+        }
+
+    def _capture_snapshot(self) -> Snapshot:
+        """Pin one consistent read snapshot of versions, edges and changes.
+
+        Runs inside the caller's db lock and inside a deferred read
+        transaction (WAL): all SELECTs see the same database state. The
+        transaction is rolled back afterwards — previews never write.
+        """
+        self.db.begin_read()
+        try:
+            versions = {row["version_id"] for row in self.db.list_versions()}
+            edges = self.db.all_parent_edges()
+            changes: dict[str, list[EffectiveChange]] = {}
+            rows = self.db.query_all(
+                "SELECT * FROM license_changes ORDER BY version_id, effective_at, change_id"
+            )
+            for row in rows:
+                changes.setdefault(row["version_id"], []).append(
+                    EffectiveChange(
+                        change_id=row["change_id"],
+                        version_id=row["version_id"],
+                        effective_at=row["effective_at"],
+                        allowed_uses=list(row["allowed_uses"]),
+                    )
+                )
+            return Snapshot(versions=versions, edges=edges, changes=changes)
+        finally:
+            self.db.rollback()
+
+
+# -- immutable in-memory snapshot ------------------------------------------
+
+
+class EffectiveChange(NamedTuple):
+    change_id: str
+    version_id: str
+    effective_at: str  # canonical UTC
+    allowed_uses: list[str]
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    versions: set[str]
+    edges: list[tuple[str, str]]  # (child, parent) in registration order
+    changes: dict[str, list[EffectiveChange]]  # keyed by version, time-sorted
+    parents_map: dict[str, list[str]] = field(default_factory=dict)
+    children_map: dict[str, list[str]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        parents: dict[str, list[str]] = {vid: [] for vid in self.versions}
+        children: dict[str, set[str]] = {vid: set() for vid in self.versions}
+        for child, parent in self.edges:  # edges arrive ordered by position
+            parents.setdefault(child, []).append(parent)
+            children.setdefault(parent, set()).add(child)
+        object.__setattr__(self, "parents_map", parents)
+        object.__setattr__(
+            self, "children_map", {vid: sorted(kids) for vid, kids in children.items()}
+        )
+
+    def closure_from(self, version_id: str) -> list[str]:
+        """Self plus all ancestors, BFS, deduplicated (diamond-safe)."""
+        parents = self.parents_map
+        order: list[str] = []
+        seen = {version_id}
+        queue = deque([version_id])
+        while queue:
+            current = queue.popleft()
+            order.append(current)
+            for parent in parents.get(current, []):
+                if parent not in seen:
+                    seen.add(parent)
+                    queue.append(parent)
+        return order
+
+    def descendants_of(self, version_id: str) -> list[str]:
+        """The version itself plus every transitive descendant, deduplicated."""
+        children = self.children_map
+        order: list[str] = []
+        seen = {version_id}
+        queue = deque([version_id])
+        while queue:
+            current = queue.popleft()
+            order.append(current)
+            for child in children.get(current, []):
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+        return order
+
+    def latest_change(
+        self,
+        version_id: str,
+        at_canonical: str,
+        override: EffectiveChange | None,
+    ) -> EffectiveChange | None:
+        """Latest change effective at or before the query instant.
+
+        ``override`` is the hypothetical change for exactly its target
+        version. If it is not effective yet, or a stored change is effective
+        later than it (already covering that instant), the stored latest
+        change wins — exactly matching the "latest effective change" rule
+        applied after a real commit.
+        """
+        stored: EffectiveChange | None = None
+        for change in self.changes.get(version_id, ()):  # time-sorted
+            if change.effective_at <= at_canonical:
+                stored = change
+            else:
+                break
+        if override is None or override.version_id != version_id:
+            return stored
+        if override.effective_at > at_canonical:
+            return stored
+        if stored is not None and stored.effective_at > override.effective_at:
+            return stored
+        return override
+
+
+def _evaluate(
+    snapshot: Snapshot,
+    version_id: str,
+    use: str,
+    at_canonical: str,
+    override: EffectiveChange | None,
+) -> dict[str, Any]:
+    """Pure counterpart of LicenseService.check_permission on a snapshot."""
+    closure = snapshot.closure_from(version_id)
+    basis: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    intersection: set[str] | None = None
+    missing_license = False
+
+    for vid in closure:
+        change = snapshot.latest_change(vid, at_canonical, override)
+        if change is None:
+            missing_license = True
+            blockers.append({"version_id": vid, "reason": "no_valid_license"})
+            continue
+
+        allowed = set(change.allowed_uses)
+        basis.append(
+            {
+                "version_id": vid,
+                "change_id": change.change_id,
+                "effective_at": parse_canonical(change.effective_at),
+                "allowed_uses": sorted(allowed),
+            }
+        )
+        intersection = allowed if intersection is None else intersection & allowed
+        if use not in allowed:
+            blockers.append(
+                {
+                    "version_id": vid,
+                    "reason": "use_not_allowed",
+                    "change_id": change.change_id,
+                    "effective_at": parse_canonical(change.effective_at),
+                    "allowed_uses": sorted(allowed),
+                }
+            )
+
+    if missing_license:
+        result_intersection: list[str] = []
+    else:
+        result_intersection = sorted(intersection) if intersection is not None else []
+    return {
+        "allowed": not blockers,
+        "closure": closure,
+        "basis": basis,
+        "blockers": blockers,
+        "allowed_uses_intersection": result_intersection,
+    }

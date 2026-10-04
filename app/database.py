@@ -113,6 +113,16 @@ class Database:
     def begin(self) -> None:
         self._conn.execute("BEGIN IMMEDIATE")
 
+    def begin_read(self) -> None:
+        """Open a deferred read transaction.
+
+        In WAL mode the first SELECT pins a consistent snapshot that stays
+        stable until :meth:`rollback`; being deferred it takes no write lock.
+        Previews read versions, parent edges and changes through one such
+        transaction so concurrent commits cannot mix snapshots.
+        """
+        self._conn.execute("BEGIN")
+
     def commit(self) -> None:
         try:
             self._conn.execute("COMMIT")
@@ -153,6 +163,21 @@ class Database:
             (version_id,),
         ).fetchall()
         return [row["parent_id"] for row in rows]
+
+    def get_children(self, version_id: str) -> list[str]:
+        """All versions that reference ``version_id`` directly as a parent."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT version_id FROM version_parents WHERE parent_id = ? "
+            "ORDER BY version_id",
+            (version_id,),
+        ).fetchall()
+        return [row["version_id"] for row in rows]
+
+    def all_parent_edges(self) -> list[tuple[str, str]]:
+        rows = self._conn.execute(
+            "SELECT version_id, parent_id FROM version_parents ORDER BY position, parent_id"
+        ).fetchall()
+        return [(row["version_id"], row["parent_id"]) for row in rows]
 
     # -- license changes --------------------------------------------------
 

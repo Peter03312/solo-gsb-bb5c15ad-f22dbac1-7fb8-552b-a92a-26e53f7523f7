@@ -17,9 +17,14 @@ from .schemas import (
     BlockerEntry,
     CreateResponse,
     ErrorDetail,
+    ImpactedVersion,
     LicenseChangeRequest,
     LicenseChangeResponse,
     PermissionResponse,
+    PreviewChangeRequest,
+    PreviewChangeStub,
+    PreviewQuery,
+    PreviewResponse,
     VersionCreateRequest,
     VersionResponse,
 )
@@ -172,6 +177,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_change(change_id: str, request: Request) -> LicenseChangeResponse:
         return LicenseChangeResponse(**service_from(request).get_change(change_id))
+
+    @app.post(
+        "/license-changes/preview",
+        response_model=PreviewResponse,
+        tags=["license-changes"],
+        summary="预演许可变更对目标版本及全部后代的影响（不写入变更）",
+        responses={
+            200: {"description": "预演完成，返回允许状态发生变化的版本及前后判定"},
+            404: {"description": "目标版本不存在"},
+            409: {"description": "变更标识冲突，或同版本同生效时刻存在不同变更"},
+            422: {"description": "生效/查询时刻缺少时区或无法解析，或参数非法"},
+        },
+    )
+    def preview_change(
+        payload: PreviewChangeRequest, request: Request
+    ) -> PreviewResponse:
+        result = service_from(request).preview_change(
+            change_id=payload.change_id,
+            version_id=payload.version_id,
+            effective_at=payload.effective_at,
+            allowed_uses=payload.allowed_uses,
+            use=payload.use,
+            at=payload.at,
+        )
+        return PreviewResponse(
+            replayed=result["replayed"],
+            change=PreviewChangeStub(**result["change"]),
+            query=PreviewQuery(**result["query"]),
+            scope=result["scope"],
+            impacted_versions=[
+                ImpactedVersion(**entry) for entry in result["impacted_versions"]
+            ],
+        )
 
     # -- permission check -------------------------------------------------
 
