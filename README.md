@@ -17,6 +17,7 @@
   - 标识相同而内容不同 → `409 conflict`；
   - 同一版本在同一生效时刻出现不同变更 → `409 conflict`；
   - 所有时间必须**带时区**（如 `...Z`、`+08:00`），服务统一按 UTC 归一化；传入无时区时间返回 `422`。
+- **变更预演**：提交前可对一次变更做干跑（`POST /license-changes/preview`），按同一数据快照比较现状与假设提交后的判定，仅返回目标版本及全部后代中允许状态发生变化的版本；不写入任何数据，详见下文 API 第 4 节。
 
 ## 目录结构
 
@@ -155,7 +156,51 @@ curl -s "http://localhost:8000/permissions/check?version_id=demo-derived-1&use=r
 # -> allowed=false, blockers 含 demo-root-a / use_not_allowed
 ```
 
-### 4. 查询接口
+### 4. 预演许可变更影响（干跑，不写入）
+
+`POST /license-changes/preview`
+
+正式提交前，传入变更标识、已登记版本、带时区的生效时刻与查询时刻、允许用途全集及待判定用途，预演该变更对**目标版本及其全部后代**的影响。服务对**同一份数据快照**分别计算「现状」与「假设提交后」两套判定（沿用祖先交集 + 最近有效变更规则）：
+
+```bash
+curl -s -X POST http://localhost:8000/license-changes/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "change_id": "preview-1",
+    "version_id": "demo-root-b",
+    "effective_at": "2026-03-01T00:00:00Z",
+    "allowed_uses": ["research", "review", "commercial"],
+    "use": "review",
+    "at": "2026-04-01T00:00:00Z"
+  }'
+```
+
+响应要点：
+
+```json
+{
+  "change": { "change_id": "preview-1", "version_id": "demo-root-b", "effective_at": "2026-03-01T00:00:00Z", "allowed_uses": ["commercial", "research", "review"] },
+  "use": "review",
+  "at": "2026-04-01T00:00:00Z",
+  "replayed": false,
+  "evaluated_versions": ["demo-root-b", "demo-derived-1"],
+  "impacts": [
+    {
+      "version_id": "demo-derived-1",
+      "before": { "allowed": false, "blockers": [ { "version_id": "demo-root-b", "reason": "use_not_allowed", "...": "…" } ] },
+      "after":  { "allowed": true,  "blockers": [] }
+    }
+  ]
+}
+```
+
+- `impacts` **只列出允许状态发生变化的版本**，每项含 `before` / `after` 的 `allowed` 与 `blockers`（阻断原因）；`evaluated_versions` 为实际评估的目标及后代（菱形继承的后代只计一次）；
+- **不误报**：查询时刻早于生效时刻，或该版本已有更晚变更覆盖假设变更时，两套判定一致，`impacts` 为空；
+- 预演**不写入**任何变更；`change_id` 省略时自动生成并随响应返回，可凭返回内容正式提交；
+- 错误语义与正式提交一致：版本不存在 `404`、同标识不同内容 `409`、同版本同生效时刻存在不同变更 `409`、时间缺时区 `422`；相同标识与内容的重放返回 `replayed=true` 且无影响；
+- 预演全程持有写锁，并发提交不会把不同快照的版本与变更混入同一次预演。
+
+### 5. 查询接口
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -200,4 +245,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验与示例数据初始化。
+测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验与示例数据初始化；预演覆盖：仅报告状态翻转版本、菱形后代去重、早于生效/被更晚变更覆盖不误报、干跑不写入、与提交一致的错误语义与重放、并发提交下的快照一致性。

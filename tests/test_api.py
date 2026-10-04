@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -54,6 +55,20 @@ def _check(client, version_id, use, at):
     return client.get(
         "/permissions/check",
         params={"version_id": version_id, "use": use, "at": at},
+    )
+
+
+def _preview(client, change_id, version_id, effective_at, uses, use, at):
+    return client.post(
+        "/license-changes/preview",
+        json={
+            "change_id": change_id,
+            "version_id": version_id,
+            "effective_at": effective_at,
+            "allowed_uses": uses,
+            "use": use,
+            "at": at,
+        },
     )
 
 
@@ -298,3 +313,251 @@ def test_demo_fixture_permissions(tmp_path):
             params={"version_id": "demo-derived-1", "use": "research", "at": _iso(2026, 7, 1)},
         ).json()
         assert later["allowed"] is True
+
+
+# -- change impact preview (dry-run) ----------------------------------------
+
+
+def test_preview_reports_only_status_changes_and_does_not_write(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d2", ["a"])
+    _change(client, "cd2", "d2", _iso(2026, 1, 1), ["research"])
+    _register(client, "u")
+    _change(client, "cu", "u", _iso(2026, 1, 1), ["research", "review"])
+
+    # Narrowing "a" to research-only flips a and d1; d2 was already blocked by
+    # its own license (status unchanged) and u is not a descendant of a.
+    resp = _preview(client, "px", "a", _iso(2026, 6, 1), ["research"], "review", _iso(2026, 7, 1))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["replayed"] is False
+    assert body["change"] == {
+        "change_id": "px",
+        "version_id": "a",
+        "effective_at": "2026-06-01T00:00:00Z",
+        "allowed_uses": ["research"],
+    }
+    assert body["use"] == "review"
+    assert body["evaluated_versions"] == ["a", "d1", "d2"]
+    assert [i["version_id"] for i in body["impacts"]] == ["a", "d1"]
+    for impact in body["impacts"]:
+        assert impact["before"] == {"allowed": True, "blockers": []}
+        assert impact["after"]["allowed"] is False
+        (blocker,) = impact["after"]["blockers"]
+        assert blocker["version_id"] == "a"
+        assert blocker["reason"] == "use_not_allowed"
+        assert blocker["change_id"] == "px"
+
+    # Dry-run writes nothing: the change does not exist and the version is
+    # untouched.
+    assert client.get("/license-changes/px").status_code == 404
+    assert [c["change_id"] for c in client.get("/versions/a").json()["changes"]] == ["ca"]
+
+    # Actually submitting the previewed change yields exactly the previewed
+    # "after" decisions.
+    assert _change(client, "px", "a", _iso(2026, 6, 1), ["research"]).status_code == 201
+    for impact in body["impacts"]:
+        actual = _check(client, impact["version_id"], "review", _iso(2026, 7, 1)).json()
+        assert actual["allowed"] == impact["after"]["allowed"]
+        assert [b["version_id"] for b in actual["blockers"]] == [
+            b["version_id"] for b in impact["after"]["blockers"]
+        ]
+
+
+def test_preview_widening_change_reports_newly_allowed(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+
+    resp = _preview(client, "px", "a", _iso(2026, 6, 1), ["research", "review"], "review", _iso(2026, 7, 1))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [i["version_id"] for i in body["impacts"]] == ["a", "d1"]
+    for impact in body["impacts"]:
+        assert impact["before"]["allowed"] is False
+        assert impact["before"]["blockers"][0]["reason"] == "use_not_allowed"
+        assert impact["before"]["blockers"][0]["version_id"] == "a"
+        assert impact["after"] == {"allowed": True, "blockers": []}
+
+
+def test_preview_no_false_positive_before_effective_or_when_overridden(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "c2", "a", _iso(2026, 8, 1), ["research"])
+
+    # Query time earlier than the hypothetical effective time: not in effect.
+    resp = _preview(client, "px", "a", _iso(2026, 6, 1), ["research"], "review", _iso(2026, 5, 1))
+    assert resp.status_code == 200
+    assert resp.json()["impacts"] == []
+
+    # A later existing change (c2 @ 2026-08-01) overrides the hypothetical
+    # 2026-06-01 change at the query time: no impact may be reported.
+    resp = _preview(client, "px", "a", _iso(2026, 6, 1), ["research"], "review", _iso(2026, 9, 1))
+    assert resp.status_code == 200
+    assert resp.json()["impacts"] == []
+
+
+def test_preview_diamond_descendants_counted_once(client):
+    # a <- b <- d, a <- c <- d : d must be evaluated and reported once.
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "b", ["a"])
+    _change(client, "cb", "b", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "c", ["a"])
+    _change(client, "cc", "c", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d", ["b", "c"])
+    _change(client, "cd", "d", _iso(2026, 1, 1), ["research", "review"])
+
+    resp = _preview(client, "px", "a", _iso(2026, 6, 1), ["research"], "review", _iso(2026, 7, 1))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["evaluated_versions"] == ["a", "b", "c", "d"]
+    assert [i["version_id"] for i in body["impacts"]] == ["a", "b", "c", "d"]
+
+
+def test_preview_error_semantics_match_submission(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+
+    # Unknown version -> 404.
+    resp = _preview(client, "px", "nope", _iso(2026, 2, 1), ["research"], "research", _iso(2026, 3, 1))
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+    # Same change id with different content -> 409.
+    resp = _preview(client, "c1", "v1", _iso(2026, 1, 1), ["commercial"], "research", _iso(2026, 3, 1))
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "conflict"
+
+    # Different change at the same (version, effective instant) -> 409.
+    resp = _preview(client, "c9", "v1", _iso(2026, 1, 1), ["research"], "research", _iso(2026, 3, 1))
+    assert resp.status_code == 409
+    assert "同一生效时刻" in resp.json()["message"]
+
+    # Naive effective_at / at -> 422.
+    resp = client.post(
+        "/license-changes/preview",
+        json={
+            "change_id": "px",
+            "version_id": "v1",
+            "effective_at": "2026-02-01T00:00:00",
+            "allowed_uses": ["research"],
+            "use": "research",
+            "at": "2026-03-01T00:00:00Z",
+        },
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/license-changes/preview",
+        json={
+            "change_id": "px",
+            "version_id": "v1",
+            "effective_at": "2026-02-01T00:00:00Z",
+            "allowed_uses": ["research"],
+            "use": "research",
+            "at": "2026-03-01T00:00:00",
+        },
+    )
+    assert resp.status_code == 422
+
+    # Blank use -> 400, same as the live check.
+    resp = _preview(client, "px", "v1", _iso(2026, 2, 1), ["research"], "  ", _iso(2026, 3, 1))
+    assert resp.status_code == 400
+
+
+def test_preview_replay_of_existing_change_has_no_effect(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research", "review"])
+
+    # Same id and same semantic content (uses reordered/duplicated): a replay.
+    resp = _preview(
+        client, "c1", "v1", _iso(2026, 1, 1), ["review", "research", "research"], "review", _iso(2026, 3, 1)
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["replayed"] is True
+    assert body["impacts"] == []
+
+
+def test_preview_generates_change_id_and_normalises_timezones(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+
+    resp = client.post(
+        "/license-changes/preview",
+        json={
+            "version_id": "v1",
+            "effective_at": "2026-02-01T08:00:00+08:00",
+            "allowed_uses": ["research", "review"],
+            "use": "review",
+            "at": "2026-03-01T00:00:00Z",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["change"]["change_id"]
+    assert body["change"]["effective_at"].startswith("2026-02-01T00:00:00")
+    assert [i["version_id"] for i in body["impacts"]] == ["v1"]
+
+
+def test_preview_is_snapshot_consistent_under_concurrent_submits(tmp_path):
+    """Concurrent commits must not leak into a preview's snapshot.
+
+    The preview holds the database lock for its whole read+compute phase, so
+    writers either commit entirely before or entirely after it; no preview may
+    observe a mix. This smoke test hammers that path from several threads.
+    """
+    db = Database(str(tmp_path / "conc.db"))
+    db.init_schema()
+    service = LicenseService(db)
+    service.register_version("root", [], "")
+    service.register_version("child", ["root"], "")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    service.submit_change("seed-root", "root", base, ["research", "review"])
+    service.submit_change("seed-child", "child", base, ["research", "review"])
+
+    errors: list[Exception] = []
+
+    def writer() -> None:
+        try:
+            for i in range(30):
+                service.submit_change(
+                    f"w-{i}",
+                    "root",
+                    base + timedelta(days=30, seconds=i),
+                    ["research"],
+                )
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    def reader() -> None:
+        try:
+            for i in range(60):
+                result = service.preview_change(
+                    f"p-{i}",
+                    "root",
+                    base + timedelta(days=60),
+                    ["research"],
+                    "review",
+                    base + timedelta(days=90),
+                )
+                assert result["evaluated_versions"] == ["root", "child"]
+                assert all(
+                    impact["before"]["allowed"] != impact["after"]["allowed"]
+                    for impact in result["impacts"]
+                )
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer) for _ in range(2)]
+    threads += [threading.Thread(target=reader) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    db.close()
+    assert not errors

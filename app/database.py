@@ -154,6 +154,15 @@ class Database:
         ).fetchall()
         return [row["parent_id"] for row in rows]
 
+    def get_children(self, version_id: str) -> list[str]:
+        """Versions that directly reference ``version_id`` as a parent."""
+        rows = self._conn.execute(
+            "SELECT version_id FROM version_parents WHERE parent_id = ? "
+            "ORDER BY version_id",
+            (version_id,),
+        ).fetchall()
+        return [row["version_id"] for row in rows]
+
     # -- license changes --------------------------------------------------
 
     def get_change(self, change_id: str) -> dict[str, Any] | None:

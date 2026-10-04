@@ -19,6 +19,8 @@ from .schemas import (
     ErrorDetail,
     LicenseChangeRequest,
     LicenseChangeResponse,
+    LicensePreviewRequest,
+    LicensePreviewResponse,
     PermissionResponse,
     VersionCreateRequest,
     VersionResponse,
@@ -172,6 +174,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_change(change_id: str, request: Request) -> LicenseChangeResponse:
         return LicenseChangeResponse(**service_from(request).get_change(change_id))
+
+    @app.post(
+        "/license-changes/preview",
+        response_model=LicensePreviewResponse,
+        tags=["license-changes"],
+        summary="预演许可变更对目标版本及全部后代的影响（干跑，不写入）",
+        responses={
+            404: {"description": "版本不存在"},
+            409: {"description": "标识相同内容不同，或同版本同时刻存在不同变更"},
+            422: {"description": "时刻缺少时区或无法解析"},
+        },
+    )
+    def preview_change(
+        payload: LicensePreviewRequest, request: Request
+    ) -> LicensePreviewResponse:
+        result = service_from(request).preview_change(
+            change_id=payload.change_id,
+            version_id=payload.version_id,
+            effective_at=payload.effective_at,
+            allowed_uses=payload.allowed_uses,
+            use=payload.use,
+            at=payload.at,
+        )
+        return LicensePreviewResponse(**result)
 
     # -- permission check -------------------------------------------------
 

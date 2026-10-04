@@ -36,3 +36,18 @@ curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
 
 say "无有效许可（变更生效之前）-> allowed=false"
 curl -s "$BASE/permissions/check?version_id=example-v1&use=research&at=2026-02-01T00:00:00Z"; echo
+
+say "预演（不写入）：若 demo-root-b 自 2026-03-01 起允许 review，demo-derived-1 将翻转为可用"
+curl -s -X POST "$BASE/license-changes/preview" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-preview-1","version_id":"demo-root-b","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research","review","commercial"],"use":"review","at":"2026-04-01T00:00:00Z"}'; echo
+
+say "预演不误报：已有更晚变更（2026-06-01）覆盖假设变更时 impacts 为空"
+curl -s -X POST "$BASE/license-changes/preview" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-preview-2","version_id":"demo-root-a","effective_at":"2026-05-01T00:00:00Z","allowed_uses":["research"],"use":"review","at":"2026-07-01T00:00:00Z"}'; echo
+
+say "预演重放：与 demo-chg-b-1 同标识同内容 -> replayed=true 且无影响"
+curl -s -X POST "$BASE/license-changes/preview" -H 'Content-Type: application/json' \
+  -d '{"change_id":"demo-chg-b-1","version_id":"demo-root-b","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research","commercial"],"use":"review","at":"2026-04-01T00:00:00Z"}'; echo
+
+say "预演不写入：按标识查询 example-preview-1 -> 404"
+curl -s "$BASE/license-changes/example-preview-1"; echo

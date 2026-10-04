@@ -69,6 +69,30 @@ class LicenseChangeRequest(BaseModel):
         return _normalise_uses(values)
 
 
+class LicensePreviewRequest(BaseModel):
+    """Dry-run a license change: same payload as a submission plus query context."""
+
+    change_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="变更标识；省略时自动生成（预演不写入，可凭返回标识正式提交）",
+    )
+    version_id: str = Field(min_length=1, description="预演变更所属的已登记版本")
+    effective_at: datetime = Field(description="UTC 生效时刻（必须带时区）")
+    allowed_uses: list[str] = Field(description="假设提交后该时刻起允许的用途全集（按全集覆盖）")
+    use: str = Field(description="待判定用途")
+    at: datetime = Field(description="查询时刻（必须带时区）")
+
+    _check_effective = field_validator("effective_at")(_ensure_aware)
+    _check_at = field_validator("at")(_ensure_aware)
+
+    @field_validator("allowed_uses")
+    @classmethod
+    def _uses(cls, values: list[str]) -> list[str]:
+        return _normalise_uses(values)
+
+
 # -- responses -------------------------------------------------------------
 
 
@@ -125,6 +149,39 @@ class CreateResponse(BaseModel):
     replayed: bool
     change: LicenseChangeResponse | None = None
     version: VersionResponse | None = None
+
+
+class PreviewChange(BaseModel):
+    """Normalised hypothetical change echoed back by the preview."""
+
+    change_id: str
+    version_id: str
+    effective_at: datetime
+    allowed_uses: list[str]
+
+
+class PreviewDecision(BaseModel):
+    allowed: bool
+    blockers: list[BlockerEntry] = Field(default_factory=list)
+
+
+class PreviewImpact(BaseModel):
+    version_id: str
+    before: PreviewDecision = Field(description="现状判定")
+    after: PreviewDecision = Field(description="假设提交后的判定")
+
+
+class LicensePreviewResponse(BaseModel):
+    change: PreviewChange
+    use: str
+    at: datetime
+    replayed: bool = Field(description="相同标识与内容的变更已存在：重放，无额外影响")
+    evaluated_versions: list[str] = Field(
+        description="实际评估的版本（目标及全部后代，去重，菱形继承只计一次）"
+    )
+    impacts: list[PreviewImpact] = Field(
+        default_factory=list, description="仅允许状态发生变化的版本"
+    )
 
 
 class ErrorDetail(BaseModel):
